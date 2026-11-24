@@ -860,9 +860,11 @@ impl AmmPool {
                 .get(&DataKey::MultisigSigners)
                 .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
             let mut approved: u32 = 0;
+            let mut approved_signers = soroban_sdk::Vec::new(&env);
             for caller in callers.iter() {
-                if signers.contains(&caller) {
+                if signers.contains(&caller) && !approved_signers.contains(&caller) {
                     caller.require_auth();
+                    approved_signers.push_back(caller);
                     approved += 1;
                 }
             }

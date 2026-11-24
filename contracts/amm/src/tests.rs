@@ -2648,8 +2648,9 @@ fn test_force_unlock_single_admin_when_no_multisig() {
     let ts = setup_pool(30);
     let env = &ts.env;
     let amm = AmmPoolClient::new(env, &ts.amm_addr);
-    // No guarded call is stranded in practice; force_unlock is exercised
-    // directly to prove the authorization gate and event.
+    env.as_contract(&ts.amm_addr, || {
+        env.storage().instance().set(&DataKey::Locked, &true);
+    });
     amm.force_unlock(&soroban_sdk::vec![env]);
     assert!(!amm.is_locked());
 }
@@ -2661,19 +2662,39 @@ fn test_force_unlock_requires_multisig_quorum_when_configured() {
     let amm = AmmPoolClient::new(env, &ts.amm_addr);
     let signer_1 = Address::generate(env);
     let signer_2 = Address::generate(env);
+    let signer_3 = Address::generate(env);
     amm.set_multisig(
         &ts.admin,
-        &soroban_sdk::vec![env, signer_1.clone(), signer_2.clone()],
-        &2u32,
+        &soroban_sdk::vec![env, signer_1.clone(), signer_2.clone(), signer_3.clone()],
+        &3u32,
     );
+    env.as_contract(&ts.amm_addr, || {
+        env.storage().instance().set(&DataKey::Locked, &true);
+    });
 
-    // Only one of the two required signers: rejected.
-    assert!(amm
-        .try_force_unlock(&soroban_sdk::vec![env, signer_1.clone()])
-        .is_err());
+    // Repeated entries must not count as separate approvals.
+    assert!(matches!(
+        amm.try_force_unlock(&soroban_sdk::vec![
+            env,
+            signer_1.clone(),
+            signer_1.clone(),
+            signer_1.clone()
+        ]),
+        Err(Ok(AmmError::Unauthorized))
+    ));
+    assert!(matches!(
+        amm.try_force_unlock(&soroban_sdk::vec![
+            env,
+            signer_1.clone(),
+            signer_1.clone(),
+            signer_2.clone()
+        ]),
+        Err(Ok(AmmError::Unauthorized))
+    ));
+    assert!(amm.is_locked());
 
-    // Both signers: succeeds.
-    amm.force_unlock(&soroban_sdk::vec![env, signer_1, signer_2]);
+    // All three distinct signers satisfy the quorum and clear the lock.
+    amm.force_unlock(&soroban_sdk::vec![env, signer_1, signer_2, signer_3]);
     assert!(!amm.is_locked());
 }
 
