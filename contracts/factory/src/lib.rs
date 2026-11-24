@@ -229,6 +229,14 @@ impl Factory {
     /// (or the CL equivalents), which have always been bounded.
     pub const MAX_UNBOUNDED_PAGE: u32 = 200;
 
+    /// Maximum number of pools a fee propagation or sweep call may process.
+    ///
+    /// Each registry entry can trigger multiple cross-contract calls, so write
+    /// pages are intentionally smaller than the read-only `MAX_UNBOUNDED_PAGE`.
+    /// Call the paginated fee methods with successive offsets to process a
+    /// larger registry.
+    pub const MAX_WRITE_PAGE: u32 = 10;
+
     /// Instance-TTL threshold and bump, in ledgers.
     ///
     /// The factory's instance entry holds the executable plus every
@@ -1430,12 +1438,15 @@ impl Factory {
 
     /// Configure the protocol treasury address and the global protocol fee rate.
     ///
-    /// Admin-only. This immediately propagates the configured rate to all
-    /// factory-administered pools, making the factory their `fee_recipient` so
-    /// `sweep_fees` can permissionlessly collect and forward fees.
+    /// Admin-only. This propagates the configured rate to the first write page
+    /// of factory-administered pools, making the factory their `fee_recipient`
+    /// so `sweep_fees` can permissionlessly collect and forward fees. Use
+    /// `set_global_fee_paginated` with successive offsets to sync the remaining
+    /// pools.
     ///
-    /// Setting `global_protocol_fee_bps` to `0` disables fee collection on all
-    /// factory-administered pools after this call completes.
+    /// Setting `global_protocol_fee_bps` to `0` disables fee collection on the
+    /// pools processed by this call. The `treasury_set` event reports
+    /// `(treasury, global_protocol_fee_bps, offset, applied, skipped)`.
     pub fn set_treasury(
         env: Env,
         admin: Address,
@@ -1456,12 +1467,12 @@ impl Factory {
             &admin,
             global_protocol_fee_bps,
             0,
-            Self::pool_count(&env),
+            Self::MAX_WRITE_PAGE,
         );
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "treasury_set"),),
-            (treasury, global_protocol_fee_bps, applied, skipped)
+            (treasury, global_protocol_fee_bps, 0u32, applied, skipped)
         );
         Ok(())
     }
@@ -1511,11 +1522,12 @@ impl Factory {
         env.storage().persistent().get(&DataKey::PoolTokens(pool))
     }
 
-    /// Set and propagate the global protocol fee configuration to all
-    /// factory-administered pools. Admin-only.
+    /// Set and propagate the global protocol fee configuration to the first
+    /// write page of factory-administered pools. Admin-only. Use
+    /// `set_global_fee_paginated` with successive offsets to process the rest.
     ///
-    /// For each registered pool whose admin is the factory admin (i.e. not
-    /// governance-controlled), calls `set_protocol_fee` on the pool with:
+    /// For each eligible pool in the page whose admin is the factory admin
+    /// (i.e. not governance-controlled), calls `set_protocol_fee` on the pool with:
     /// - `recipient` = this factory contract (so the factory can later sweep)
     /// - `protocol_fee_bps` = `protocol_fee_bps`
     ///
@@ -1532,8 +1544,9 @@ impl Factory {
     /// `GlobalProtocolFeeBps` is the requested rate; `get_pool_fee_status` shows
     /// each pool's effective rate.
     ///
-    /// Returns the number of pools the rate was applied to. The emitted
-    /// `global_fee_set` event carries `(bps, offset, applied, skipped)`.
+    /// Returns the number of pools the rate was applied to on this page. The
+    /// emitted `global_fee_set` event carries
+    /// `(protocol_fee_bps, offset, applied, skipped)`.
     pub fn set_global_fee(
         env: Env,
         admin: Address,
@@ -1551,7 +1564,7 @@ impl Factory {
             .instance()
             .set(&DataKey::GlobalProtocolFeeBps, &protocol_fee_bps);
         let (applied, skipped) =
-            Self::sync_global_fee_page(&env, &admin, protocol_fee_bps, 0, Self::pool_count(&env));
+            Self::sync_global_fee_page(&env, &admin, protocol_fee_bps, 0, Self::MAX_WRITE_PAGE);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "global_fee_set"),),
@@ -1561,7 +1574,8 @@ impl Factory {
     }
 
     /// Propagate the global protocol fee configuration to a page of
-    /// factory-administered pools. Admin-only.
+    /// factory-administered pools. Admin-only. `limit` is capped at
+    /// `MAX_WRITE_PAGE`.
     pub fn set_global_fee_paginated(
         env: Env,
         admin: Address,
@@ -1578,20 +1592,27 @@ impl Factory {
             .instance()
             .get(&DataKey::GlobalProtocolFeeBps)
             .unwrap_or(0);
+        let pool_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
+        let page_offset = (offset as u64).min(pool_count) as u32;
         let (applied, skipped) =
             Self::sync_global_fee_page(&env, &admin, protocol_fee_bps, offset, limit);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "global_fee_set"),),
-            (protocol_fee_bps, offset, applied, skipped)
+            (protocol_fee_bps, page_offset, applied, skipped)
         );
         Ok(applied)
     }
 
-    /// Sweep accrued protocol fees from all factory-owned pools into the
-    /// treasury. **Permissionless** — callable by anyone.
+    /// Sweep accrued protocol fees from the first write page of factory-owned
+    /// pools into the treasury. **Permissionless** — callable by anyone. Use
+    /// `sweep_fees_paginated` with successive offsets to sweep the rest.
     ///
-    /// For each registered pool that is not governance-controlled, calls
+    /// For each pool in the page that is not governance-controlled, calls
     /// `withdraw_protocol_fees()` on the pool
     /// (which succeeds because the factory is the `fee_recipient`) and then
     /// transfers the received tokens to the treasury.
@@ -1602,20 +1623,22 @@ impl Factory {
     ///
     /// Pools whose `fee_recipient` is not this factory (or whose withdrawal
     /// fails) are skipped rather than aborting the sweep; the `fees_swept` event
-    /// reports `(treasury, token, offset, swept, collected, skipped)`.
+    /// reports `(treasury, token, offset, pools_swept, total_collected,
+    /// pools_skipped)` for this page only.
     ///
-    /// Returns the total amount of `token` collected.
+    /// Returns the total amount of `token` collected on this page.
     ///
     /// # Prerequisites
     /// - `set_treasury` must have been called to configure the treasury and sync
     ///   the factory as the `fee_recipient` on the target pools.
     pub fn sweep_fees(env: Env, token: Address) -> Result<i128, FactoryError> {
         Self::extend_ttl(&env);
-        let (_, total_collected) = Self::sweep_fees_page(&env, &token, 0, Self::pool_count(&env))?;
+        let (_, total_collected) = Self::sweep_fees_page(&env, &token, 0, Self::MAX_WRITE_PAGE)?;
         Ok(total_collected)
     }
 
-    /// Paginated variant of `sweep_fees` for large pool registries.
+    /// Paginated variant of `sweep_fees` for large pool registries. `limit` is
+    /// capped at `MAX_WRITE_PAGE`.
     pub fn sweep_fees_paginated(
         env: Env,
         token: Address,
@@ -1646,7 +1669,7 @@ impl Factory {
             .unwrap_or(0);
 
         let start = (offset as u64).min(count);
-        let end = (start + limit as u64).min(count);
+        let end = (start + limit.min(Self::MAX_WRITE_PAGE) as u64).min(count);
         let mut pools_swept: u32 = 0;
         let mut pools_skipped: u32 = 0;
         let mut total_collected: i128 = 0;
@@ -1731,7 +1754,7 @@ impl Factory {
             (
                 treasury,
                 token.clone(),
-                offset,
+                start as u32,
                 pools_swept,
                 total_collected,
                 pools_skipped
@@ -1741,13 +1764,6 @@ impl Factory {
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
-
-    fn pool_count(env: &Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::PoolCount)
-            .unwrap_or(0u64) as u32
-    }
 
     /// Stored admin, written by `initialize`; absent means not initialized.
     fn read_admin(env: &Env) -> Result<Address, FactoryError> {
@@ -1829,7 +1845,7 @@ impl Factory {
             .unwrap_or(0);
 
         let start = (offset as u64).min(count);
-        let end = (start + limit as u64).min(count);
+        let end = (start + limit.min(Self::MAX_WRITE_PAGE) as u64).min(count);
         let mut applied: u32 = 0;
         let mut skipped: u32 = 0;
 
@@ -3483,6 +3499,28 @@ mod tests {
         expected
     }
 
+    fn seed_fee_pool_index(env: &Env, factory: &Address, n: u64) {
+        let token_a = Address::generate(env);
+        let token_b = Address::generate(env);
+        let mut pools = Vec::new(env);
+        for _ in 0..n {
+            pools.push_back(Address::generate(env));
+        }
+        env.as_contract(factory, || {
+            for i in 0..n {
+                let pool = pools.get(i as u32).unwrap();
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::PoolByIndex(i), &pool);
+                env.storage().persistent().set(
+                    &DataKey::PoolTokens(pool),
+                    &(token_a.clone(), token_b.clone()),
+                );
+            }
+            env.storage().instance().set(&DataKey::PoolCount, &n);
+        });
+    }
+
     fn bounded_factory(env: &Env) -> Address {
         env.budget().reset_unlimited();
         env.mock_all_auths();
@@ -3561,6 +3599,145 @@ mod tests {
         assert_eq!(seen.len() as u64, total);
         for i in 0..total {
             assert_eq!(seen.get(i as u32).unwrap(), expected.get(i as u32).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_fee_write_entrypoints_process_only_one_write_page() {
+        use soroban_sdk::testutils::Events as _;
+
+        let f = fx();
+        let factory = FactoryClient::new(&f.env, &f.factory_addr);
+        let page = Factory::MAX_WRITE_PAGE;
+        let total = page as u64 + 3;
+        seed_fee_pool_index(&f.env, &f.factory_addr, total);
+
+        let treasury = Address::generate(&f.env);
+        factory.set_treasury(&f.admin, &treasury, &10);
+        let (_, _, treasury_data) = f.env.events().all().last().unwrap();
+
+        assert_eq!(factory.set_global_fee(&f.admin, &5), 0);
+        let (_, _, data) = f.env.events().all().last().unwrap();
+        let (_, payload): (u32, (i128, u32, u32, u32)) =
+            TryFromVal::try_from_val(&f.env, &data).expect("global_fee_set payload");
+        assert_eq!(payload, (5, 0, 0, page));
+
+        let (_, payload): (u32, (Address, i128, u32, u32, u32)) =
+            TryFromVal::try_from_val(&f.env, &treasury_data).expect("treasury_set payload");
+        assert_eq!(payload, (treasury.clone(), 10, 0, 0, page));
+
+        let token = Address::generate(&f.env);
+        assert_eq!(factory.sweep_fees(&token), 0);
+        let (_, _, data) = f.env.events().all().last().unwrap();
+        let (_, payload): (u32, (Address, Address, u32, u32, i128, u32)) =
+            TryFromVal::try_from_val(&f.env, &data).expect("fees_swept payload");
+        assert_eq!(payload, (treasury.clone(), token.clone(), 0, 0, 0, page));
+
+        let mut global_fee_skipped = 0;
+        let mut sweep_skipped = 0;
+        let mut offset = 0;
+        while offset < total as u32 {
+            assert_eq!(
+                factory.set_global_fee_paginated(&f.admin, &offset, &u32::MAX),
+                0
+            );
+            let (_, _, data) = f.env.events().all().last().unwrap();
+            let (_, payload): (u32, (i128, u32, u32, u32)) =
+                TryFromVal::try_from_val(&f.env, &data).expect("global_fee_set payload");
+            let expected_count = (total as u32 - offset).min(page);
+            assert_eq!(payload, (5, offset, 0, expected_count));
+            global_fee_skipped += payload.3;
+
+            assert_eq!(
+                factory.sweep_fees_paginated(&token, &offset, &u32::MAX),
+                (0, 0)
+            );
+            let (_, _, data) = f.env.events().all().last().unwrap();
+            let (_, payload): (u32, (Address, Address, u32, u32, i128, u32)) =
+                TryFromVal::try_from_val(&f.env, &data).expect("fees_swept payload");
+            assert_eq!(
+                payload,
+                (
+                    treasury.clone(),
+                    token.clone(),
+                    offset,
+                    0,
+                    0,
+                    expected_count
+                )
+            );
+            sweep_skipped += payload.5;
+
+            offset += page;
+        }
+        assert_eq!(global_fee_skipped, total as u32);
+        assert_eq!(sweep_skipped, total as u32);
+    }
+
+    #[test]
+    fn test_treasury_page_and_global_fee_pagination_cover_all_pools() {
+        use soroban_sdk::testutils::Events as _;
+
+        let f = fx();
+        let factory = FactoryClient::new(&f.env, &f.factory_addr);
+        let (token_a, token_b) = tokens(&f);
+        let page = Factory::MAX_WRITE_PAGE;
+        let total = page + 3;
+        let mut pools = Vec::new(&f.env);
+        for i in 0..total {
+            let (pool, _) = factory.create_pool_with_fee_bps(
+                &f.admin,
+                &token_a,
+                &token_b,
+                &(100 + i as i128),
+                &None,
+            );
+            pools.push_back(pool);
+        }
+
+        let treasury = Address::generate(&f.env);
+        factory.set_treasury(&f.admin, &treasury, &10);
+        let (_, _, data) = f.env.events().all().last().unwrap();
+        let (_, payload): (u32, (Address, i128, u32, u32, u32)) =
+            TryFromVal::try_from_val(&f.env, &data).expect("treasury_set payload");
+        assert_eq!(payload, (treasury, 10, 0, page, 0));
+        for i in 0..total {
+            let expected = if i < page { (10, true) } else { (0, false) };
+            assert_eq!(
+                factory.get_pool_fee_status(&pools.get(i).unwrap()),
+                Some(expected)
+            );
+        }
+
+        let applied = factory.set_global_fee(&f.admin, &5);
+        assert_eq!(applied, page);
+        let (_, _, data) = f.env.events().all().last().unwrap();
+        let (_, payload): (u32, (i128, u32, u32, u32)) =
+            TryFromVal::try_from_val(&f.env, &data).expect("global_fee_set payload");
+        assert_eq!(payload, (5, 0, page, 0));
+        for i in 0..total {
+            let expected = if i < page { (5, true) } else { (0, false) };
+            assert_eq!(
+                factory.get_pool_fee_status(&pools.get(i).unwrap()),
+                Some(expected)
+            );
+        }
+
+        let mut applied_total = 0;
+        let mut offset = 0;
+        while offset < total {
+            let applied = factory.set_global_fee_paginated(&f.admin, &offset, &u32::MAX);
+            let expected_count = (total - offset).min(page);
+            assert_eq!(applied, expected_count);
+            applied_total += applied;
+            offset += page;
+        }
+        assert_eq!(applied_total, total);
+        for i in 0..total {
+            assert_eq!(
+                factory.get_pool_fee_status(&pools.get(i).unwrap()),
+                Some((5, true))
+            );
         }
     }
 

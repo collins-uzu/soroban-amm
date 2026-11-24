@@ -1151,6 +1151,7 @@
             "fields": [
               "treasury",
               "global_protocol_fee_bps",
+              "offset",
               "applied",
               "skipped"
             ]
