@@ -1974,10 +1974,8 @@ impl AmmPool {
     /// Deposit tokens into the pool and receive LP shares in return.
     ///
     /// On the first deposit any ratio is accepted and the initial share supply is
-    /// set to the geometric mean of the two amounts. Subsequent deposits must
-    /// match the current pool ratio (within integer rounding); excess tokens are
-    /// **not** refunded automatically — callers should compute amounts off-chain
-    /// before calling.
+    /// set to the geometric mean of the two amounts. Subsequent deposits mint
+    /// shares at the limiting token ratio and refund any unused token amounts.
     ///
     /// Requires `provider` to have authorized this call.
     ///
@@ -2029,7 +2027,7 @@ impl AmmPool {
         let lp_token: Address = Self::read_lp_token(&env)?;
         let total_shares: i128 = Self::get_total_shares(env.clone());
 
-        let (shares_to_provider, shares_locked) = Self::compute_liquidity_mint(
+        let (shares_to_provider, shares_locked, used_a, used_b) = Self::compute_liquidity_mint(
             &env,
             amount_a,
             amount_b,
@@ -2044,15 +2042,29 @@ impl AmmPool {
         let client_b = SepTokenClient::new(&env, &token_b);
         client_a.transfer(&provider, &env.current_contract_address(), &amount_a);
         client_b.transfer(&provider, &env.current_contract_address(), &amount_b);
+        if amount_a > used_a {
+            client_a.transfer(
+                &env.current_contract_address(),
+                &provider,
+                &(amount_a - used_a),
+            );
+        }
+        if amount_b > used_b {
+            client_b.transfer(
+                &env.current_contract_address(),
+                &provider,
+                &(amount_b - used_b),
+            );
+        }
 
         // Update reserves.
         let total_minted = shares_to_provider + shares_locked;
         env.storage()
             .instance()
-            .set(&DataKey::ReserveA, &(reserve_a + amount_a));
+            .set(&DataKey::ReserveA, &(reserve_a + used_a));
         env.storage()
             .instance()
-            .set(&DataKey::ReserveB, &(reserve_b + amount_b));
+            .set(&DataKey::ReserveB, &(reserve_b + used_b));
         env.storage()
             .instance()
             .set(&DataKey::TotalShares, &(total_shares + total_minted));
@@ -2071,7 +2083,7 @@ impl AmmPool {
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "add_liquidity"), provider),
-            (amount_a, amount_b, shares_to_provider)
+            (used_a, used_b, shares_to_provider)
         );
 
         Ok(shares_to_provider)
@@ -3427,7 +3439,8 @@ impl AmmPool {
     /// Like `add_liquidity` but measures the actual token amounts received
     /// by the pool via pre/post balance snapshots rather than trusting the
     /// nominal `amount_a`/`amount_b` values. LP shares are minted proportional
-    /// to what the pool actually received.
+    /// to what the pool actually received, and unused received amounts are
+    /// refunded to the provider.
     ///
     /// # Parameters
     /// - `min_received_a` – Minimum actual `token_a` the pool must receive.
@@ -3493,7 +3506,7 @@ impl AmmPool {
         let reserve_b: i128 = Self::get_reserve_b(env.clone());
         let total_shares: i128 = Self::get_total_shares(env.clone());
 
-        let (shares, shares_locked) = Self::compute_liquidity_mint(
+        let (shares, shares_locked, used_a, used_b) = Self::compute_liquidity_mint(
             &env,
             actual_a,
             actual_b,
@@ -3503,12 +3516,19 @@ impl AmmPool {
             min_shares,
         )?;
 
+        if actual_a > used_a {
+            client_a.transfer(&pool, &provider, &(actual_a - used_a));
+        }
+        if actual_b > used_b {
+            client_b.transfer(&pool, &provider, &(actual_b - used_b));
+        }
+
         env.storage()
             .instance()
-            .set(&DataKey::ReserveA, &(reserve_a + actual_a));
+            .set(&DataKey::ReserveA, &(reserve_a + used_a));
         env.storage()
             .instance()
-            .set(&DataKey::ReserveB, &(reserve_b + actual_b));
+            .set(&DataKey::ReserveB, &(reserve_b + used_b));
         env.storage().instance().set(
             &DataKey::TotalShares,
             &(total_shares + shares + shares_locked),
@@ -3526,7 +3546,7 @@ impl AmmPool {
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "add_liquidity"), provider),
-            (actual_a, actual_b, shares)
+            (used_a, used_b, shares)
         );
 
         Ok(shares)
@@ -3537,9 +3557,11 @@ impl AmmPool {
     /// Shared first-deposit / proportional share computation used by both
     /// dd_liquidity and dd_liquidity_fot.
     ///
-    /// Returns (shares_to_provider, shares_locked). On a pool's first deposit
-    /// MINIMUM_LIQUIDITY shares are carved out and locked (Issue #294); the
-    /// provider's share (after the lock) is compared against min_shares.
+    /// Returns (shares_to_provider, shares_locked, used_a, used_b). On a pool's
+    /// first deposit both amounts are used in full and MINIMUM_LIQUIDITY shares
+    /// are carved out and locked (Issue #294). Subsequent deposits use only the
+    /// amounts backing the minted shares. The provider's share (after the lock)
+    /// is compared against min_shares.
     /// Returns EmptyPool rather than dividing by zero when shares exist but a
     /// reserve is zero.
     #[allow(clippy::too_many_arguments)]
@@ -3551,7 +3573,7 @@ impl AmmPool {
         reserve_b: i128,
         total_shares: i128,
         min_shares: i128,
-    ) -> Result<(i128, i128), AmmError> {
+    ) -> Result<(i128, i128, i128, i128), AmmError> {
         const MINIMUM_LIQUIDITY: i128 = 1_000;
         let shares = if total_shares == 0 {
             Self::sqrt(amount_a * amount_b)
@@ -3585,7 +3607,15 @@ impl AmmPool {
         if shares_to_provider < min_shares {
             return Err(AmmError::SlippageExceeded);
         }
-        Ok((shares_to_provider, shares_locked))
+        let (used_a, used_b) = if total_shares == 0 {
+            (amount_a, amount_b)
+        } else {
+            (
+                shares * reserve_a / total_shares,
+                shares * reserve_b / total_shares,
+            )
+        };
+        Ok((shares_to_provider, shares_locked, used_a, used_b))
     }
 
     /// Returns the cumulative liquidity accumulator and the timestamp of the last update.

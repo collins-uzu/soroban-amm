@@ -1443,7 +1443,8 @@ fn test_imbalanced_deposit_uses_minimum_ratio() {
 
     // The contract uses storage total_shares (includes locked MINIMUM_LIQUIDITY).
     // Capture before the second deposit so the ratio reflects the seeded state.
-    let storage_total = amm.get_info().total_shares;
+    let before = amm.get_info();
+    let storage_total = before.total_shares;
     let shares_from_a = 500_000_i128 * storage_total / 1_000_000;
     let shares_from_b = 1_500_000_i128 * storage_total / 2_000_000;
 
@@ -1462,9 +1463,81 @@ fn test_imbalanced_deposit_uses_minimum_ratio() {
         "shares minted must use the limiting (TokenA) ratio"
     );
 
+    let used_a = shares_minted * before.reserve_a / storage_total;
+    let used_b = shares_minted * before.reserve_b / storage_total;
+    assert_eq!(
+        StellarTokenClient::new(env, &ts.ta_addr).balance(&lp2),
+        500_000 - used_a
+    );
+    assert_eq!(
+        StellarTokenClient::new(env, &ts.tb_addr).balance(&lp2),
+        1_500_000 - used_b
+    );
+
     let info = amm.get_info();
-    assert_eq!(info.reserve_a, 1_500_000);
-    assert_eq!(info.reserve_b, 3_500_000);
+    assert_eq!(info.reserve_a, before.reserve_a + used_a);
+    assert_eq!(info.reserve_b, before.reserve_b + used_b);
+    assert_eq!(info.total_shares, before.total_shares + shares_minted);
+}
+
+#[test]
+fn test_balanced_deposit_uses_both_amounts_without_refund() {
+    let ts = setup_pool(30);
+    let amm = AmmPoolClient::new(&ts.env, &ts.amm_addr);
+    let ta = StellarAssetClient::new(&ts.env, &ts.ta_addr);
+    let tb = StellarAssetClient::new(&ts.env, &ts.tb_addr);
+
+    let seeder = Address::generate(&ts.env);
+    ta.mint(&seeder, &1_000_000);
+    tb.mint(&seeder, &1_000_000);
+    amm.add_liquidity(&seeder, &1_000_000, &1_000_000, &0, &u64::MAX);
+
+    let provider = Address::generate(&ts.env);
+    ta.mint(&provider, &100_000);
+    tb.mint(&provider, &100_000);
+    let before = amm.get_info();
+    let shares = amm.add_liquidity(&provider, &100_000, &100_000, &0, &u64::MAX);
+
+    assert_eq!(
+        StellarTokenClient::new(&ts.env, &ts.ta_addr).balance(&provider),
+        0
+    );
+    assert_eq!(
+        StellarTokenClient::new(&ts.env, &ts.tb_addr).balance(&provider),
+        0
+    );
+    let after = amm.get_info();
+    assert_eq!(after.reserve_a, before.reserve_a + 100_000);
+    assert_eq!(after.reserve_b, before.reserve_b + 100_000);
+    assert_eq!(after.total_shares, before.total_shares + shares);
+}
+
+#[test]
+fn test_first_imbalanced_deposit_uses_both_amounts_without_refund() {
+    let ts = setup_pool(30);
+    let amm = AmmPoolClient::new(&ts.env, &ts.amm_addr);
+    let ta = StellarAssetClient::new(&ts.env, &ts.ta_addr);
+    let tb = StellarAssetClient::new(&ts.env, &ts.tb_addr);
+
+    let provider = Address::generate(&ts.env);
+    ta.mint(&provider, &1_000_000);
+    tb.mint(&provider, &2_000_000);
+    let shares = amm.add_liquidity(&provider, &1_000_000, &2_000_000, &0, &u64::MAX);
+
+    let geometric_mean = 1_414_213_i128;
+    assert_eq!(shares, geometric_mean - 1_000);
+    assert_eq!(
+        StellarTokenClient::new(&ts.env, &ts.ta_addr).balance(&provider),
+        0
+    );
+    assert_eq!(
+        StellarTokenClient::new(&ts.env, &ts.tb_addr).balance(&provider),
+        0
+    );
+    let info = amm.get_info();
+    assert_eq!(info.reserve_a, 1_000_000);
+    assert_eq!(info.reserve_b, 2_000_000);
+    assert_eq!(info.total_shares, geometric_mean);
 }
 
 // ── Issue #35: partial remove_liquidity leaves correct residual reserves ──────
@@ -5628,6 +5701,68 @@ fn test_fot_token_two_percent_deduction_mints_from_actual_and_locks() {
     assert_eq!(info.total_shares, 1_960_000);
     let lp = token::LpTokenClient::new(&env, &lp_addr);
     assert_eq!(lp.balance(&amm_addr), 1_000);
+}
+
+#[test]
+fn test_fot_imbalanced_deposit_refunds_excess_using_actual_received() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(12345);
+    let admin = Address::generate(&env);
+    let amm_addr = env.register_contract(None, AmmPool);
+    let lp_addr = env.register_contract(None, LpToken);
+    token::LpTokenClient::new(&env, &lp_addr).initialize(
+        &amm_addr,
+        &soroban_sdk::String::from_str(&env, "AMM LP Token"),
+        &soroban_sdk::String::from_str(&env, "ALP"),
+        &7u32,
+    );
+    let fot_addr = env.register_contract(None, FotToken);
+    let (tb, tb_sac) = create_sac(&env, &admin);
+    let amm = AmmPoolClient::new(&env, &amm_addr);
+    amm.initialize(
+        &admin,
+        &fot_addr,
+        &tb.address,
+        &lp_addr,
+        &30_i128,
+        &admin,
+        &0_i128,
+    );
+
+    let provider = Address::generate(&env);
+    let fot = FotTokenClient::new(&env, &fot_addr);
+    fot.mint(&provider, &2_000_000);
+    tb_sac.mint(&provider, &1_960_000);
+    amm.add_liquidity_fot(
+        &provider,
+        &2_000_000,
+        &1_960_000,
+        &1_960_000,
+        &0,
+        &0,
+        &u64::MAX,
+    );
+
+    fot.mint(&provider, &1_500_000);
+    tb_sac.mint(&provider, &980_000);
+    let shares = amm.add_liquidity_fot(&provider, &1_500_000, &980_000, &0, &0, &0, &u64::MAX);
+
+    assert_eq!(shares, 980_000);
+    assert_eq!(fot.balance(&provider), 480_200);
+    assert_eq!(
+        StellarTokenClient::new(&env, &tb.address).balance(&provider),
+        0
+    );
+    assert_eq!(fot.balance(&amm_addr), 2_940_000);
+    assert_eq!(
+        StellarTokenClient::new(&env, &tb.address).balance(&amm_addr),
+        2_940_000
+    );
+    let info = amm.get_info();
+    assert_eq!(info.reserve_a, 2_940_000);
+    assert_eq!(info.reserve_b, 2_940_000);
+    assert_eq!(info.total_shares, 2_940_000);
 }
 
 // ── Pause policy ──────────────────────────────────────────────────────────────
