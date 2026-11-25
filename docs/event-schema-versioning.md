@@ -220,9 +220,9 @@ a representative call sequence and asserts every pool event carries the leading
 | `creation_paused` / `creation_unpaused` | `(admin: Address)` |
 | `mode_changed` | `(enabled: bool)` |
 | `creation_fee_set` | `(fee_token: Address, fee_amount: i128)` |
-| `treasury_set` | `(treasury: Address, global_protocol_fee_bps: u32, updated: u32)` |
-| `global_fee_set` | `(protocol_fee_bps: u32, offset: u32, updated: u32)` |
-| `fees_swept` | `(treasury: Address, token: Address, offset: u32, pools_swept: u32, total_collected: i128)` |
+| `treasury_set` | `(treasury: Address, global_protocol_fee_bps: i128, offset: u32, applied: u32, skipped: u32)` |
+| `global_fee_set` | `(protocol_fee_bps: i128, offset: u32, applied: u32, skipped: u32)` |
+| `fees_swept` | `(treasury: Address, token: Address, offset: u32, pools_swept: u32, total_collected: i128, pools_skipped: u32)` |
 | `creation_fee_paid` | `(caller: Address, fee_amount: i128)` |
 | `pool_meta` | `(label: String, category: PoolCategory, created_at: u64, created_by: Address, verified: bool)` |
 | `pool_ver` | `(verified: bool)` |
@@ -757,7 +757,7 @@ count. Events marked unversioned carry their payload without the
 | `creation_fee_set` | 1 | `fee_token`, `fee_amount` | v1 |
 | `admin_nominated` | 1 | `admin`, `new_admin` | v1 |
 | `admin_changed` | 1 | `new_admin` | v1 |
-| `treasury_set` | 1 | `treasury`, `global_protocol_fee_bps`, `applied`, `skipped` | v1 |
+| `treasury_set` | 1 | `treasury`, `global_protocol_fee_bps`, `offset`, `applied`, `skipped` | v1 |
 | `global_fee_set` | 1 | `protocol_fee_bps`, `offset`, `applied`, `skipped` | v1 |
 | `fees_swept` | 1 | `treasury`, `token`, `offset`, `pools_swept`, `total_collected`, `pools_skipped` | v1 |
 | `creation_fee_paid` | 1 | `caller`, `fee_amount` | v1 |

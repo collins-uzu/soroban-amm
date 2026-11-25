@@ -15689,7 +15689,7 @@
       },
       {
         "function_v0": {
-          "doc": "Sweep accrued protocol fees from all factory-owned pools into the\\ntreasury. **Permissionless** \\xe2\\x80\\x94 callable by anyone.\\n\\nFor each registered pool that is not governance-controlled, calls\\n`withdraw_protocol_fees()` on the pool\\n(which succeeds because the factory is the `fee_recipient`) and then\\ntransfers the received tokens to the treasury.\\n\\nNo trust is required: regardless of who triggers the sweep, funds are\\ncryptographically guaranteed to route to the governance-configured\\ntreasury address stored in this contract.\\n\\nPools whose `fee_recipient` is not this factory (or whose withdrawal\\nfails) are skipped rather than aborting the sweep; the `fees_swept` event\\nreports `(treasury, token, offset, swept, collected, skipped)`.\\n\\nReturns the total amount of `token` collected.\\n\\n# Prerequisites\\n- `set_treasury` must have been called to configure the treasury and sync\\nthe factory as the `fee_recipient` on the target pools.",
+          "doc": "Sweep accrued protocol fees from the first write page of factory-owned\\npools into the treasury. **Permissionless** \\xe2\\x80\\x94 callable by anyone. Use\\n`sweep_fees_paginated` with successive offsets to sweep the rest.\\n\\nFor each registered pool that is not governance-controlled, calls\\n`withdraw_protocol_fees()` on the pool\\n(which succeeds because the factory is the `fee_recipient`) and then\\ntransfers the received tokens to the treasury.\\n\\nNo trust is required: regardless of who triggers the sweep, funds are\\ncryptographically guaranteed to route to the governance-configured\\ntreasury address stored in this contract.\\n\\nPools whose `fee_recipient` is not this factory (or whose withdrawal\\nfails) are skipped rather than aborting the sweep; the `fees_swept` event\\nreports `(treasury, token, offset, pools_swept, total_collected,\\npools_skipped)` for the page processed by this call.\\n\\nReturns the total amount of `token` collected on this page.\\n\\n# Prerequisites\\n- `set_treasury` must have been called to configure the treasury and sync",
           "inputs": [
             {
               "doc": "",
@@ -15952,7 +15952,7 @@
       },
       {
         "function_v0": {
-          "doc": "Configure the protocol treasury address and the global protocol fee rate.\\n\\nAdmin-only. This immediately propagates the configured rate to all\\nfactory-administered pools, making the factory their `fee_recipient` so\\n`sweep_fees` can permissionlessly collect and forward fees.\\n\\nSetting `global_protocol_fee_bps` to `0` disables fee collection on all\\nfactory-administered pools after this call completes.",
+          "doc": "Configure the protocol treasury address and the global protocol fee rate.\\n\\nAdmin-only. This propagates the configured rate to the first write page\\nof factory-administered pools, making the factory their `fee_recipient`\\nso `sweep_fees` can permissionlessly collect and forward fees. Use\\n`set_global_fee_paginated` with successive offsets to sync remaining pools.\\n\\nSetting `global_protocol_fee_bps` to `0` disables fee collection on the\\npools processed by this call. The `treasury_set` event reports\\n`(treasury, global_protocol_fee_bps, offset, applied, skipped)`.",
           "inputs": [
             {
               "doc": "",
@@ -16158,7 +16158,7 @@
       },
       {
         "function_v0": {
-          "doc": "Set and propagate the global protocol fee configuration to all\\nfactory-administered pools. Admin-only.\\n\\nFor each registered pool whose admin is the factory admin (i.e. not\\ngovernance-controlled), calls `set_protocol_fee` on the pool with:\\n- `recipient` = this factory contract (so the factory can later sweep)\\n- `protocol_fee_bps` = `protocol_fee_bps`\\n\\nGovernance-controlled pools are skipped \\xe2\\x80\\x94 they must update fee settings\\nvia a governance proposal.\\n\\n**Clamp rule (issue #1108).** The AMM requires\\n`protocol_fee_bps < fee_bps`, so the rate pushed to each pool is\\n`min(global_bps, fee_bps - 1)`: a pool with a lower swap fee than the\\nglobal rate is *clamped*, not skipped, and still gets the factory as its\\n`fee_recipient`. A pool with a non-positive swap fee cannot carry a\\nprotocol fee and is skipped, as is any pool whose `set_protocol_fee` call\\nfails (`try_` call), so one bad pool never reverts the batch. The stored\\n`GlobalProtocolFeeBps` is the requested rate; `get_pool_fee_status` shows\\neach pool's effective rat",
+          "doc": "Set and propagate the global protocol fee configuration to the first\\nwrite page of factory-administered pools. Admin-only. Use\\n`set_global_fee_paginated` with successive offsets to process the rest.\\n\\nFor each registered pool whose admin is the factory admin (i.e. not\\ngovernance-controlled), calls `set_protocol_fee` on the pool with:\\n- `recipient` = this factory contract (so the factory can later sweep)\\n- `protocol_fee_bps` = `protocol_fee_bps`\\n\\nGovernance-controlled pools are skipped \\xe2\\x80\\x94 they must update fee settings\\nvia a governance proposal.\\n\\n**Clamp rule (issue #1108).** The AMM requires\\n`protocol_fee_bps < fee_bps`, so the rate pushed to each pool is\\n`min(global_bps, fee_bps - 1)`: a pool with a lower swap fee than the\\nglobal rate is *clamped*, not skipped, and still gets the factory as its\\n`fee_recipient`. A pool with a non-positive swap fee cannot carry a\\nprotocol fee and is skipped, as is any pool whose `set_protocol_fee` call\\nfails (`try_` call), so one bad pool never reverts the batch. The stored\\n`Gl",
           "inputs": [
             {
               "doc": "",
@@ -16697,7 +16697,7 @@
       },
       {
         "function_v0": {
-          "doc": "Paginated variant of `sweep_fees` for large pool registries.",
+          "doc": "Paginated variant of `sweep_fees` for large pool registries. `limit` is\\ncapped at `MAX_WRITE_PAGE`.",
           "inputs": [
             {
               "doc": "",
@@ -16917,7 +16917,7 @@
       },
       {
         "function_v0": {
-          "doc": "Propagate the global protocol fee configuration to a page of\\nfactory-administered pools. Admin-only.",
+          "doc": "Propagate the global protocol fee configuration to a page of\\nfactory-administered pools. Admin-only. `limit` is capped at\\n`MAX_WRITE_PAGE`.",
           "inputs": [
             {
               "doc": "",
