@@ -1128,6 +1128,10 @@ impl Governance {
             return Err(GovernanceError::ProposalDefeated);
         }
 
+        proposal.executed = true;
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_key_ttl(&env, &proposal_key);
+
         let amm_pool = Self::read_amm_pool(&env)?;
         let amm_client = AmmPoolClient::new(&env, &amm_pool);
         match &proposal.kind {
@@ -1243,10 +1247,6 @@ impl Governance {
                 ClPoolClient::new(&env, &params.cl_pool).set_position_nft(&self_addr, &params.nft);
             }
         }
-
-        proposal.executed = true;
-        env.storage().persistent().set(&proposal_key, &proposal);
-        Self::bump_key_ttl(&env, &proposal_key);
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -3450,13 +3450,58 @@ mod tests {
             limit
         }
 
-        /// Satisfy the FactoryInterface trait; not exercised by these tests.
+        /// Reenter governance once when treasury updates are configured to do so.
         pub fn set_treasury(
-            _env: Env,
+            env: Env,
             _admin: Address,
             _treasury: Address,
             _global_protocol_fee_bps: i128,
         ) {
+            let should_revert: bool = env
+                .storage()
+                .instance()
+                .get(&Symbol::new(&env, "revert_treasury"))
+                .unwrap_or(false);
+            if should_revert {
+                panic!("configured factory failure");
+            }
+
+            let call_count: u32 = env
+                .storage()
+                .instance()
+                .get(&Symbol::new(&env, "treasury_calls"))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "treasury_calls"), &(call_count + 1));
+
+            let reentered: bool = env
+                .storage()
+                .instance()
+                .get(&Symbol::new(&env, "reentered"))
+                .unwrap_or(false);
+            if !reentered {
+                env.storage()
+                    .instance()
+                    .set(&Symbol::new(&env, "reentered"), &true);
+                let governance: Address = env
+                    .storage()
+                    .instance()
+                    .get(&Symbol::new(&env, "governance"))
+                    .unwrap();
+                let proposal_id: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&Symbol::new(&env, "proposal_id"))
+                    .unwrap();
+                let already_executed = matches!(
+                    GovernanceClient::new(&env, &governance).try_execute(&proposal_id),
+                    Err(Ok(GovernanceError::AlreadyExecuted))
+                );
+                env.storage()
+                    .instance()
+                    .set(&Symbol::new(&env, "already_executed"), &already_executed);
+            }
         }
 
         /// Return how many times `set_global_fee_paginated` was called.
@@ -3465,6 +3510,35 @@ mod tests {
                 .instance()
                 .get(&Symbol::new(&env, "called"))
                 .unwrap_or(0u32)
+        }
+
+        pub fn configure_reentrancy(env: Env, governance: Address, proposal_id: u32) {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "governance"), &governance);
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "proposal_id"), &proposal_id);
+        }
+
+        pub fn configure_treasury_revert(env: Env) {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "revert_treasury"), &true);
+        }
+
+        pub fn treasury_call_count(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "treasury_calls"))
+                .unwrap_or(0)
+        }
+
+        pub fn reentry_was_rejected(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "already_executed"))
+                .unwrap_or(false)
         }
     }
 
@@ -3656,6 +3730,57 @@ mod tests {
 
         gov.execute(&pid);
         assert_eq!(gov.proposal_status(&pid), ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn test_execute_rejects_reentrant_call_from_factory() {
+        let s = setup_factory_gov(0);
+        let gov = s.gov();
+        let factory = s.factory();
+        let treasury = Address::generate(&s.env);
+
+        let pid = gov.propose(
+            &s.proposer,
+            &ProposalKind::UpdateFactoryTreasury(UpdateFactoryTreasuryParams {
+                factory: s.factory_addr.clone(),
+                treasury,
+                global_protocol_fee_bps: 100,
+            }),
+        );
+        factory.configure_reentrancy(&s.gov_addr, &pid);
+        gov.vote(&s.proposer, &pid, &Vote::For);
+        let proposal = gov.get_proposal(&pid);
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+
+        gov.execute(&pid);
+
+        assert!(factory.reentry_was_rejected());
+        assert_eq!(factory.treasury_call_count(), 1);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn test_execute_reverts_state_when_factory_call_fails() {
+        let s = setup_factory_gov(0);
+        let gov = s.gov();
+        let factory = s.factory();
+        factory.configure_treasury_revert();
+
+        let pid = gov.propose(
+            &s.proposer,
+            &ProposalKind::UpdateFactoryTreasury(UpdateFactoryTreasuryParams {
+                factory: s.factory_addr.clone(),
+                treasury: Address::generate(&s.env),
+                global_protocol_fee_bps: 100,
+            }),
+        );
+        gov.vote(&s.proposer, &pid, &Vote::For);
+        let proposal = gov.get_proposal(&pid);
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+
+        assert!(gov.try_execute(&pid).is_err());
+        assert!(!gov.get_proposal(&pid).executed);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Queued);
     }
 
     // ── Proposal enumeration (issue #793) ────────────────────────────────────
